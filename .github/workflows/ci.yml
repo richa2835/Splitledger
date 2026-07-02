@@ -1,0 +1,68 @@
+name: CI
+
+# Runs on every push and every pull request against main, so a broken
+# concurrency fix or idempotency bug gets caught automatically -- not
+# discovered manually later.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Real Postgres and Redis, not mocks -- the whole point of this project
+    # is proving correctness under a real database's locking behavior, so
+    # the CI environment has to match that.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: splitledger
+          POSTGRES_PASSWORD: splitledger
+          POSTGRES_DB: splitledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U splitledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://splitledger:splitledger@localhost:5432/splitledger
+      REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        run: pytest tests/ -v -s
+
+      - name: Smoke-test the API actually boots
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          sleep 3
+          curl --fail http://localhost:8000/health

@@ -1,6 +1,26 @@
 # SplitLedger
 
+[![CI](https://github.com/richa2835/Splitledger/actions/workflows/ci.yml/badge.svg)](https://github.com/richa2835/Splitledger/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A backend service for wallet transfers and group expense splitting, built to stay correct under concurrent requests and duplicate/retried calls — the same class of problem real payment systems solve.
+
+## Table of contents
+
+- [Why this project exists](#why-this-project-exists)
+- [Tech stack](#tech-stack)
+- [Architecture](#architecture)
+- [Data model](#data-model)
+- [Concurrency handling](#concurrency-handling--two-implementations-compared)
+- [Idempotency](#idempotency)
+- [Rate limiting](#rate-limiting)
+- [Debt simplification](#group-expense-splitting--debt-simplification)
+- [API endpoints](#api-endpoints)
+- [Running locally](#running-locally)
+- [Running the tests](#running-the-tests)
+- [CI/CD](#cicd)
+- [Load testing](#load-testing)
+- [Project structure](#project-structure)
 
 ## Why this project exists
 
@@ -15,6 +35,45 @@ Most student projects handle the "happy path": one user, one request, no failure
 | Cache/Locks | Redis | rate limiting |
 | Containerization | Docker + docker-compose | one-command local setup |
 | Load testing | k6 | scriptable, gives p50/p95/p99 out of the box |
+
+## Architecture
+
+```mermaid
+graph LR
+    Client[Client]
+    API[FastAPI app]
+    PG[(PostgreSQL<br/>source of truth)]
+    Redis[(Redis<br/>rate limit buckets)]
+
+    Client -->|HTTP| API
+    API -->|SELECT ... FOR UPDATE<br/>or version CAS| PG
+    API -->|token bucket check| Redis
+    PG -->|ledger_entries| Audit[Replay ledger<br/>to reconstruct any balance]
+```
+
+### How a transfer request actually flows
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant DB as Postgres
+
+    C->>A: POST /transfer (idempotency_key)
+    A->>DB: INSERT pending txn WHERE key UNIQUE
+    alt key already exists & completed
+        DB-->>A: existing txn
+        A-->>C: return cached result (no reprocessing)
+    else key already exists & pending
+        DB-->>A: existing txn
+        A-->>C: 409 Conflict
+    else new key
+        A->>DB: lock accounts (lower id first)
+        DB-->>A: rows locked
+        A->>DB: debit + credit + mark completed
+        A-->>C: 200 OK
+    end
+```
 
 ## Data model
 
@@ -46,11 +105,11 @@ Measured directly by `tests/test_concurrency.py` on this machine:
 
 | Strategy | Requests | Total time | Throughput | Final balance correct? |
 |---|---|---|---|---|
-| Pessimistic (`FOR UPDATE`) | 100 | 1.67s | 60.0 req/s | ✅ 9900.00 (expected 9900.00) |
-| Optimistic (version + retry) | 100 | 3.28s | 30.5 req/s | ✅ 9900.00 (expected 9900.00) |
-| No locking (control) | 100 | 1.87s | 53.5 req/s | ❌ 9994.00 (expected 9900.00 — **lost 94 updates**) |
+| Pessimistic (`FOR UPDATE`) | 100 | 1.67s | 60.0 req/s | correct — 9900.00 (expected 9900.00) |
+| Optimistic (version + retry) | 100 | 3.28s | 30.5 req/s | correct — 9900.00 (expected 9900.00) |
+| No locking (control) | 100 | 1.87s | 53.5 req/s | wrong — 9994.00 (expected 9900.00, lost 94 updates) |
 
-That last row is the point: with no protection at all, concurrent requests reading-then-writing the same row silently lose updates. Both real strategies fix it; pessimistic wins on throughput here specifically *because* all 100 requests hammer the same single row — that's the exact scenario row locking is built for. Under **low** contention (many different account pairs), optimistic typically wins instead — try it yourself and compare.
+That last row is the point: with no protection, concurrent requests reading-then-writing the same row silently lose updates. Both real strategies fix it. Pessimistic came out faster here because all 100 requests were hitting the same single account — that's the case row locking handles well. With low contention (many different account pairs instead), optimistic tends to do better since it isn't waiting on a lock. Worth trying both ways yourself, numbers shift depending on the contention pattern.
 
 **Run this yourself** (numbers will vary slightly run to run):
 ```bash
@@ -136,6 +195,16 @@ docker-compose up --build
 docker-compose exec api pytest tests/ -v -s
 ```
 
+## CI/CD
+
+Every push and pull request to `main` triggers [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+1. Spins up Postgres and Redis containers (real ones, not mocks, since the point of the concurrency tests is checking against a real database's actual locking behavior)
+2. Installs dependencies
+3. Runs the full test suite, including the 100-concurrent-transfer test
+4. Boots the API and hits `/health` as a smoke test
+
+If any of these steps fail, the badge at the top of this README goes red.
+
 ## Load testing
 
 Install [k6](https://k6.io/docs/get-started/installation/), then with the API running:
@@ -156,6 +225,9 @@ Error rate at peak load: ___
 
 ```
 splitledger/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                   # runs tests on every push
 ├── app/
 │   ├── main.py
 │   ├── models.py
@@ -176,20 +248,10 @@ splitledger/
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
-## What I'd say about this in an interview
+## Lessons learned
 
 "I built a wallet system and initially had a race condition where concurrent transfers corrupted account balances. I diagnosed it with a concurrency test firing 100 simultaneous requests, then fixed it two ways — pessimistic row locking and optimistic versioning — and measured the throughput tradeoff between them: pessimistic won under heavy single-row contention, which is exactly the scenario it's designed for. I also added idempotency keys after realizing a naive retry could double-charge a user, backed by a database unique constraint so it holds up even under a race on the key itself."
-
-## Pushing to GitHub
-
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git remote add origin https://github.com/YOUR-USERNAME/splitledger.git
-git branch -M main
-git push -u origin main
-```
